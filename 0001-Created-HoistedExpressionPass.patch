@@ -1,0 +1,710 @@
+From ca713e953ac774e3a3ff293fcafec1fae6036947 Mon Sep 17 00:00:00 2001
+From: Teja <teja@mail.com>
+Date: Sat, 12 Mar 2023 14:27:04 +0000
+Subject: [PATCH] Created HoistedExpressionPass
+
+---
+ .../Utils/HoistAnticipatedExpressions.h       | 201 ++++++++
+ llvm/lib/Passes/PassBuilder.cpp               |   1 +
+ llvm/lib/Passes/PassRegistry.def              |   1 +
+ llvm/lib/Transforms/Utils/CMakeLists.txt      |   1 +
+ .../Utils/HoistAnticipatedExpressions.cpp     | 444 ++++++++++++++++++
+ 5 files changed, 648 insertions(+)
+ create mode 100644 llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+ create mode 100644 llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+
+diff --git a/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+new file mode 100644
+index 000000000000..07fb31d93bec
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+@@ -0,0 +1,201 @@
++#ifndef LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
++#define LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
++
++#include "llvm/ADT/BitVector.h"
++
++#include "llvm/IR/InstrTypes.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Operator.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <string>
++#include <vector>
++
++#undef DEBUG_TYPE
++#define DEBUG_TYPE "hoist-anticipated-expressions"
++
++namespace llvm {
++
++class AnticipatedExpression {
++public:
++  std::vector<Value *> InstOperandValues;
++  unsigned int InstOpCode;
++  const char *InstOpCodeName;
++  /*
++    1. CallBase Instrs.
++    2. Cast Instrs.
++    3. (Overflow)BinaryOperator Instrs.
++  */
++  unsigned int InstType;
++  unsigned int InstrOperandCount;
++  Instruction *ActualInst;
++
++  // CallInstr variables
++  unsigned int CallArgCount;
++  std::vector<Value *> CallOperandValues;
++  Function *CalledFunc;
++  std::string CalledFuncName;
++  Type *CallType;
++
++  // CastInstr variables
++  Type *SrcType, *DestType, *CastType;
++
++  // OverFlowBinOp variables
++  bool HasNSWSemantic;
++  bool HasNUWSemantic;
++
++public:
++  struct BBFlowData {
++    BitVector InSet;
++    BitVector OutSet;
++    BitVector DefSet;
++    BitVector UseSet;
++  };
++
++  AnticipatedExpression(Instruction *Instr) {
++    LLVM_DEBUG(Instr->dump());
++    ActualInst = Instr;
++    InstOpCode = Instr->getOpcode();
++    InstOpCodeName = Instr->getOpcodeName(InstOpCode);
++    InstrOperandCount = Instr->getNumOperands();
++    HasNSWSemantic = false;
++    HasNUWSemantic = false;
++    InstType = 0;
++
++    for (unsigned int OperandIndex = 0; OperandIndex < InstrOperandCount;
++         ++OperandIndex) {
++      InstOperandValues.push_back(Instr->getOperand(OperandIndex));
++    }
++    if (CallBase *CallInstr = dyn_cast_or_null<CallBase>(Instr)) {
++      InstType = 1;
++      CallArgCount = CallInstr->arg_size();
++      for (unsigned int CallOperandIndex = 0; CallOperandIndex < CallArgCount;
++           ++CallOperandIndex) {
++        CallOperandValues.push_back(CallInstr->getArgOperand(CallOperandIndex));
++      }
++      CalledFunc = CallInstr->getCalledFunction();
++      CalledFuncName = CalledFunc->getName().str();
++      CallType = CallInstr->getFunctionType();
++    } else if (CastInst *CastInstr = dyn_cast_or_null<CastInst>(Instr)) {
++      InstType = 2;
++      SrcType = CastInstr->getSrcTy();
++      DestType = CastInstr->getDestTy();
++      CastType = CastInstr->getType();
++    } else if (OverflowingBinaryOperator *OvBinInstr =
++                   dyn_cast_or_null<OverflowingBinaryOperator>(Instr)) {
++      InstType = 3;
++      HasNSWSemantic = OvBinInstr->hasNoSignedWrap();
++      HasNUWSemantic = OvBinInstr->hasNoUnsignedWrap();
++    } else if (isa<BinaryOperator>(Instr)) {
++      InstType = 3;
++    }
++  }
++
++  bool operator==(const AnticipatedExpression &Expr) const {
++    bool ResultValue = false;
++    switch (InstType) {
++    case 1:
++      if ((InstType == Expr.InstType) && (InstOpCode == Expr.InstOpCode) &&
++          (InstrOperandCount == Expr.InstrOperandCount) &&
++          (CallArgCount == Expr.CallArgCount) &&
++          (CalledFunc == Expr.CalledFunc) && (CallType == Expr.CallType)) {
++        ResultValue = true;
++        for (unsigned int ArgIndex = 0; ArgIndex < CallArgCount; ++ArgIndex) {
++          if (CallOperandValues[ArgIndex] != Expr.CallOperandValues[ArgIndex]) {
++            ResultValue = false;
++            break;
++          }
++        }
++      }
++      break;
++    case 2:
++      if ((InstType == Expr.InstType) && (InstOpCode == Expr.InstOpCode) &&
++          (InstrOperandCount == Expr.InstrOperandCount) &&
++          (SrcType == Expr.SrcType) && (DestType == Expr.DestType) &&
++          (CastType == Expr.CastType)) {
++        ResultValue = true;
++        for (unsigned int ArgIndex = 0; ArgIndex < InstrOperandCount;
++             ++ArgIndex) {
++          if (InstOperandValues[ArgIndex] != Expr.InstOperandValues[ArgIndex]) {
++            ResultValue = false;
++            break;
++          }
++        }
++      }
++      break;
++    case 3:
++      if ((InstType == Expr.InstType) && (InstOpCode == Expr.InstOpCode) &&
++          (InstrOperandCount == Expr.InstrOperandCount) &&
++          (HasNSWSemantic == Expr.HasNSWSemantic) &&
++          (HasNUWSemantic == Expr.HasNUWSemantic)) {
++        ResultValue = true;
++        for (unsigned int ArgIndex = 0; ArgIndex < InstrOperandCount;
++             ++ArgIndex) {
++          if (InstOperandValues[ArgIndex] != Expr.InstOperandValues[ArgIndex]) {
++            ResultValue = false;
++            break;
++          }
++        }
++      }
++      break;
++    default:
++      break;
++    }
++    return ResultValue;
++  }
++
++  void dumpInst() const { LLVM_DEBUG(ActualInst->dump()); }
++
++  void dump() const {
++    LLVM_DEBUG(dbgs() << "Opcode :- " << InstOpCodeName << "\nInstOperCount :- "
++                      << InstrOperandCount << "\n");
++    LLVM_DEBUG(dbgs() << "OperandData Values:- \n");
++    for (auto *OpData : InstOperandValues) {
++      LLVM_DEBUG(dbgs() << "Operand Value :- \n");
++      LLVM_DEBUG(OpData->dump());
++    }
++
++    switch (InstType) {
++    case 1:
++      LLVM_DEBUG(dbgs() << "CallInst\nArgCount " << CallArgCount
++                        << "\nFuncName :- " << CalledFuncName
++                        << "\nCallType :- ");
++      LLVM_DEBUG(CallType->dump());
++      LLVM_DEBUG(dbgs() << "CallOperands :-");
++      for (auto *CallData : CallOperandValues) {
++        LLVM_DEBUG(CallData->dump());
++      }
++      break;
++    case 2:
++      LLVM_DEBUG(dbgs() << "CastInst\n"
++                        << "\nType :- ");
++      LLVM_DEBUG(CastType->dump());
++      LLVM_DEBUG(dbgs() << "\nSrcType :- "; SrcType->dump());
++      LLVM_DEBUG(dbgs() << "DestType :- ");
++      LLVM_DEBUG(DestType->dump());
++      break;
++    case 3:
++      LLVM_DEBUG(dbgs() << "BinOpInstr\n"
++                        << "NSW :- " << HasNSWSemantic << "\nNUW :- "
++                        << HasNUWSemantic);
++      break;
++    default:
++      LLVM_DEBUG(dbgs() << "Default Soon\n");
++      break;
++    }
++  }
++};
++
++class HoistAnticipatedExpressionsPass
++    : public PassInfoMixin<HoistAnticipatedExpressionsPass> {
++public:
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
++};
++
++} // namespace llvm
++
++#endif // LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index 4b8754df7fb6..f491bb93341e 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -222,6 +222,7 @@
+ #include "llvm/Transforms/Scalar/TLSVariableHoist.h"
+ #include "llvm/Transforms/Scalar/TailRecursionElimination.h"
+ #include "llvm/Transforms/Scalar/WarnMissedTransforms.h"
++#include "llvm/Transforms/Utils/HoistAnticipatedExpressions.h"
+ #include "llvm/Transforms/Utils/AddDiscriminators.h"
+ #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
+ #include "llvm/Transforms/Utils/BreakCriticalEdges.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 73ab87dd8823..26bf195edb1a 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -260,6 +260,7 @@ FUNCTION_ALIAS_ANALYSIS("tbaa", TypeBasedAA())
+ #ifndef FUNCTION_PASS
+ #define FUNCTION_PASS(NAME, CREATE_PASS)
+ #endif
++FUNCTION_PASS("hoist-anticipated-expressions", HoistAnticipatedExpressionsPass())
+ FUNCTION_PASS("aa-eval", AAEvaluator())
+ FUNCTION_PASS("adce", ADCEPass())
+ FUNCTION_PASS("add-discriminators", AddDiscriminatorsPass())
+diff --git a/llvm/lib/Transforms/Utils/CMakeLists.txt b/llvm/lib/Transforms/Utils/CMakeLists.txt
+index 6663ce6c4b0a..e609fdf2143b 100644
+--- a/llvm/lib/Transforms/Utils/CMakeLists.txt
++++ b/llvm/lib/Transforms/Utils/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ add_llvm_component_library(LLVMTransformUtils
++  HoistAnticipatedExpressions.cpp
+   AddDiscriminators.cpp
+   AMDGPUEmitPrintf.cpp
+   ASanStackFrameLayout.cpp
+diff --git a/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp b/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+new file mode 100644
+index 000000000000..2aa09288d467
+--- /dev/null
++++ b/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+@@ -0,0 +1,444 @@
++#include "llvm/ADT/BitVector.h"
++#include "llvm/ADT/Statistic.h"
++
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/CFG.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/InstrTypes.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Operator.h"
++#include "llvm/IR/User.h"
++
++#include "llvm/Pass.h"
++
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <deque>
++#include <map>
++#include <utility>
++#include <vector>
++
++#include "llvm/Transforms/Utils/HoistAnticipatedExpressions.h"
++
++STATISTIC(HoistedExprcount, "Number of Hoisted Expressions");
++
++using namespace llvm;
++using namespace std;
++
++map<AnticipatedExpression *, vector<Instruction *>> ExprInstrMapper;
++map<AnticipatedExpression *, int> ExprMapData;
++map<int, AnticipatedExpression *> ReverseExprMapData;
++map<Instruction *, pair<BasicBlock *, AnticipatedExpression *>>
++    InstBBExprMapData;
++map<Instruction *, AnticipatedExpression *> IntrExprMapper;
++
++void clearGlobalData() {
++  ExprInstrMapper.clear();
++  ExprMapData.clear();
++  ReverseExprMapData.clear();
++  InstBBExprMapData.clear();
++  IntrExprMapper.clear();
++}
++
++void printExprData() {
++  // Prints `Expression Index of Instruction : Instruction` data
++  LLVM_DEBUG(dbgs() << "\n");
++  for (auto ExprData : IntrExprMapper) {
++    LLVM_DEBUG(dbgs() << ExprMapData[ExprData.second] << ": ");
++    LLVM_DEBUG(ExprData.first->dump());
++  }
++}
++
++void printBitVector(BitVector SetData) {
++  // Helper Function for printing the BitVector data.
++  for (unsigned int IterIndex = 0; IterIndex < SetData.size(); ++IterIndex) {
++    if (SetData[IterIndex]) {
++      ReverseExprMapData[IterIndex]->dumpInst();
++      LLVM_DEBUG(dbgs() << IterIndex << ",");
++    }
++  }
++  LLVM_DEBUG(dbgs() << "\n");
++}
++
++void printFlowData(
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &PrintData) {
++  // Prints the IN and OUT sets for all the BasicBlocks of the Function.
++  for (auto FlowPrintData : PrintData) {
++    LLVM_DEBUG(dbgs() << "For BB :-\n"
++                      << FlowPrintData.first->getName() << "\n");
++    LLVM_DEBUG(dbgs() << "InSet :- \t");
++    printBitVector(FlowPrintData.second->InSet);
++    LLVM_DEBUG(dbgs() << "OutSet :-\t");
++    printBitVector(FlowPrintData.second->OutSet);
++    LLVM_DEBUG(dbgs() << "\n");
++  }
++}
++
++void printExprInstrMapper(
++    map<AnticipatedExpression *, vector<Instruction *>> &MapperData) {
++  // Printing Only Expression which have more than 1 common Instruction.
++  for (auto ExMapValues : MapperData) {
++    if (ExMapValues.second.size() > 1) {
++      LLVM_DEBUG(dbgs() << "Expression data :- \n");
++      LLVM_DEBUG(ExMapValues.first->dump());
++      LLVM_DEBUG(dbgs() << "\nInstructions :- \n");
++      for (Instruction *InstData : ExMapValues.second) {
++        LLVM_DEBUG(InstData->dump());
++      }
++      LLVM_DEBUG(dbgs() << "\n\n");
++    }
++  }
++}
++
++int getExpressionIndex(AnticipatedExpression *Expr) {
++  // TODO :- Possible Optimization?
++  // Checks if an Expression of similar instruction data is mapped
++  for (pair<llvm::AnticipatedExpression *const, int> Expr1 : ExprMapData) {
++    LLVM_DEBUG(dbgs() << "\nComparing :-\nExpr1 :- \n");
++    LLVM_DEBUG(Expr1.first->dump());
++    LLVM_DEBUG(dbgs() << "\n\nExpr2 :- \n");
++    LLVM_DEBUG(Expr->dump());
++    LLVM_DEBUG(dbgs() << "\n");
++    if (*Expr == *Expr1.first) {
++      LLVM_DEBUG(dbgs() << "\nMatched\n");
++      return Expr1.second;
++    } else {
++      LLVM_DEBUG(dbgs() << "\nNot Matched\n");
++    }
++  }
++  return -1;
++}
++
++bool isInstructionOfInterest(Instruction *Instr) {
++  // Filtering Instructions of Interests.
++  // clang-format off
++  if (isa<BinaryOperator>(Instr) || 
++      isa<OverflowingBinaryOperator>(Instr) ||
++      isa<CallBase>(Instr) ||
++      isa<CmpInst>(Instr) ||
++      isa<CastInst>(Instr))
++    // clang-format on
++    return true;
++  return false;
++}
++
++int buildUniqueExpressions(Function *Func) {
++  // Helper Function that builds the map data of expression by assigning them an
++  // unique count value.
++  int ExprCount = 0;
++  for (BasicBlock &BB : *Func) {
++    for (Instruction &Instr : BB) {
++      if (isInstructionOfInterest(&Instr)) {
++        LLVM_DEBUG(dbgs() << "Instruction to Expression :- \n");
++        AnticipatedExpression *ExpressionData =
++            new AnticipatedExpression(&Instr);
++        int ExprIndex = getExpressionIndex(ExpressionData);
++        LLVM_DEBUG(dbgs() << "Status Value is " << ExprIndex << "\n");
++        if (ExprIndex == -1) {
++          ExprMapData[ExpressionData] = ExprCount;
++          ReverseExprMapData[ExprCount] = ExpressionData;
++          ++ExprCount;
++        } else {
++          ExpressionData = ReverseExprMapData[ExprIndex];
++        }
++        InstBBExprMapData[&Instr] = make_pair(&BB, ExpressionData);
++        IntrExprMapper[&Instr] = ExpressionData;
++        ExprInstrMapper[ExpressionData].push_back(&Instr);
++      }
++    }
++  }
++  printExprInstrMapper(ExprInstrMapper);
++  return ExprCount;
++}
++
++bool computeDefSet(
++    BasicBlock *BB, int &ExprCount,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &BBFlowMapData) {
++  // Computes the DEF Set for the provided BasicBlock.
++  bool HasTerminatorInstr = false;
++  for (Instruction &Inst : *BB) {
++    if (isa<ReturnInst>(Inst)) {
++      HasTerminatorInstr = true;
++    }
++    if (isInstructionOfInterest(&Inst)) {
++      LLVM_DEBUG(dbgs() << "Use Instructions :- \n");
++      for (User *Use : Inst.users()) {
++        Instruction *UseInstr = dyn_cast<Instruction>(Use);
++        LLVM_DEBUG(UseInstr->dump());
++        if (isInstructionOfInterest(UseInstr) &&
++            (UseInstr->getFunction() == BB->getParent())) {
++          // Selects the Use Instruction of the current Instruction provided
++          // they are within same Function.
++          AnticipatedExpression *Expr = InstBBExprMapData[UseInstr].second;
++          int ExprIndexValue = ExprMapData[Expr];
++          BBFlowMapData[BB]->DefSet.set(ExprIndexValue);
++          LLVM_DEBUG(dbgs() << "Possible Def for Inst:- \n");
++          LLVM_DEBUG(Inst.dump());
++          LLVM_DEBUG(dbgs() << "\n is :- \n");
++          LLVM_DEBUG(UseInstr->dump());
++          LLVM_DEBUG(dbgs() << "\n");
++        }
++      }
++    }
++  }
++  return HasTerminatorInstr;
++}
++
++void computeUseSet(
++    BasicBlock *BB, int &ExprCount,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &BBFlowMapData) {
++  // Computes the USE Set for the provided BasicBlock.
++  for (Instruction &Inst : *BB) {
++    if (isInstructionOfInterest(&Inst)) {
++      bool IsPreviouslyDefined = false;
++      for (unsigned int ArgIndex = 0; ArgIndex < Inst.getNumOperands();
++           ++ArgIndex) {
++        if (Instruction *OperandInstr =
++                dyn_cast_or_null<Instruction>(Inst.getOperand(ArgIndex))) {
++          if (OperandInstr->getParent() == BB &&
++              OperandInstr->comesBefore(&Inst)) {
++            IsPreviouslyDefined = true;
++            break;
++          }
++        }
++      }
++      if (!IsPreviouslyDefined) {
++        // Select those instructions whose values are not defined previosuly.
++        AnticipatedExpression *Expr = InstBBExprMapData[&Inst].second;
++        int ExprIndexValue = ExprMapData[Expr];
++        BBFlowMapData[BB]->UseSet.set(ExprIndexValue);
++        LLVM_DEBUG(dbgs() << "Possible Use for Inst:- \n");
++        LLVM_DEBUG(Inst.dump());
++        Expr->dumpInst();
++      }
++    }
++  }
++}
++
++map<BasicBlock *, AnticipatedExpression::BBFlowData *>
++initFlowData(Function *Func, int &ExprCount) {
++  // Initializing FlowData using BoundaryCondition and computing the DEF, USE
++  // Sets for the BasicBlocks.
++  map<BasicBlock *, AnticipatedExpression::BBFlowData *> NewFlowData;
++  for (BasicBlock &BB : *Func) {
++    // clang-format off
++    AnticipatedExpression::BBFlowData *FlowSetValues = new AnticipatedExpression::BBFlowData();
++    FlowSetValues->InSet = BitVector(ExprCount, true);
++    FlowSetValues->OutSet = BitVector(ExprCount, false);
++    FlowSetValues->DefSet = BitVector(ExprCount, false);
++    FlowSetValues->UseSet = BitVector(ExprCount, false);
++    // clang-format on
++    NewFlowData[&BB] = FlowSetValues;
++    bool IsExitBlock = computeDefSet(&BB, ExprCount, NewFlowData);
++    LLVM_DEBUG(dbgs() << "Def for " << BB.getName() << "\n");
++    printBitVector(NewFlowData[&BB]->DefSet);
++    if (IsExitBlock) {
++      NewFlowData[&BB]->InSet.flip();
++    }
++    computeUseSet(&BB, ExprCount, NewFlowData);
++    LLVM_DEBUG(dbgs() << "Use for " << BB.getName() << "\n");
++    printBitVector(NewFlowData[&BB]->UseSet);
++  }
++  return NewFlowData;
++}
++
++bool computeInOutSets(
++    BasicBlock *BB, int &ExprCount,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &FlowValues) {
++  // Computes the IN and OUT Sets of the BasicBlocks from the previous FlowData.
++  BitVector OUTSet, DefSet, OldINSet;
++  OldINSet = FlowValues[BB]->InSet;
++  OUTSet = BitVector(ExprCount, true);
++  int HasSucc = false;
++  for (BasicBlock *SuccBB : successors(BB)) {
++    OUTSet &= FlowValues[SuccBB]->InSet;
++    HasSucc = true;
++  }
++  if (!HasSucc)
++    OUTSet.flip();
++  FlowValues[BB]->OutSet = OUTSet;
++  DefSet = FlowValues[BB]->DefSet;
++  DefSet.flip();
++  OUTSet &= DefSet;
++  OUTSet |= FlowValues[BB]->UseSet;
++  FlowValues[BB]->InSet = OUTSet;
++  LLVM_DEBUG(dbgs() << "Old In Set\n");
++  printBitVector(OldINSet);
++  LLVM_DEBUG(dbgs() << "\nNew In Set\n");
++  printBitVector(OUTSet);
++  LLVM_DEBUG(dbgs() << "\nDone\n");
++  return OldINSet != OUTSet;
++}
++
++bool reComputeFlowData(
++    Function *Func, int &ExprCount,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &FlowData) {
++  // Helper function to calculate IN and OUT sets for all Basicblocks of the
++  // function.
++  bool FixedPointValuesChanged = false;
++  for (BasicBlock &BB : *Func) {
++    FixedPointValuesChanged |= computeInOutSets(&BB, ExprCount, FlowData);
++    printFlowData(FlowData);
++  }
++  return FixedPointValuesChanged;
++}
++
++vector<AnticipatedExpression *> computeFlowData(
++    Function *Func, int &ExprCount,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> &BBFlowMapData) {
++  // Helper function that Iteratively keeps calculating IN and OUT sets untill
++  // the IN set is converged.
++  int FixedPointIterCount = 1;
++  bool FixedPointAnalysisConverged = false;
++  printFlowData(BBFlowMapData);
++  while (!FixedPointAnalysisConverged) {
++    LLVM_DEBUG(dbgs() << "Performing " << FixedPointIterCount << "\n");
++    FixedPointAnalysisConverged =
++        !reComputeFlowData(Func, ExprCount, BBFlowMapData);
++    printFlowData(BBFlowMapData);
++    ++FixedPointIterCount;
++  }
++  LLVM_DEBUG(dbgs() << "Converged after " << FixedPointIterCount
++                    << " iterations\n IN and OUT Sets are as follows\n");
++  printFlowData(BBFlowMapData);
++  vector<AnticipatedExpression *> ExprData;
++  for (BasicBlock &BB : *Func) {
++    BitVector BBOutSet = BBFlowMapData[&BB]->OutSet;
++    if (BBOutSet.count()) {
++      LLVM_DEBUG(BB.dump());
++      LLVM_DEBUG(dbgs() << "Expressions to hoist :- \n");
++      for (unsigned int Index = 0; Index < BBOutSet.size(); ++Index) {
++        if (BBOutSet[Index]) {
++          ExprData.push_back(ReverseExprMapData[Index]);
++          ReverseExprMapData[Index]->dumpInst();
++        }
++      }
++    }
++  }
++  return ExprData;
++}
++
++vector<Instruction *>
++getHoistInstructionsFromExpr(AnticipatedExpression *HoistExpr,
++                             BasicBlock *OUTBB,
++                             vector<Instruction *> &AllInstuctionOfExpr) {
++  // Function that make sures to select correct Instruction from the expression
++  // data (shouldn't select instruction that results in value errors because of
++  // unsatisfieddominationator property).
++  set<BasicBlock *> VistedBB, PossibleBB;
++  map<BasicBlock *, vector<Instruction *>> BBInstrMapData;
++  vector<Instruction *> ResultData;
++  deque<BasicBlock *> BFSQueue;
++
++  for (Instruction *Instr : AllInstuctionOfExpr) {
++    BasicBlock *BBData = InstBBExprMapData[Instr].first;
++    PossibleBB.insert(BBData);
++    BBInstrMapData[BBData].push_back(Instr);
++  }
++
++  // BFS to keep looking for the instructions in the Successor blocks.
++  BFSQueue.push_back(OUTBB);
++  VistedBB.insert(OUTBB);
++  while (!BFSQueue.empty()) {
++    BasicBlock *CurrBB = BFSQueue.front();
++    BFSQueue.pop_front();
++    if (PossibleBB.count(CurrBB)) {
++      vector<Instruction *> PossibleInstValue = BBInstrMapData[CurrBB];
++      ResultData.insert(ResultData.end(), PossibleInstValue.begin(),
++                        PossibleInstValue.end());
++    }
++    for (auto *SuccBB : successors(CurrBB)) {
++      if (!VistedBB.count(SuccBB)) {
++        BFSQueue.push_back(SuccBB);
++        VistedBB.insert(SuccBB);
++      }
++    }
++  }
++  return ResultData;
++}
++
++void hoistExpressionData(
++    vector<AnticipatedExpression *> &ExprsToHoist,
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> FuncFlowData) {
++  // Helper Function that helps hoist the Instructions when provided with the
++  // Flow and Expression data.
++  for (pair<BasicBlock *, AnticipatedExpression::BBFlowData *> BBFlowData :
++       FuncFlowData) {
++    BitVector BBOutSet = BBFlowData.second->OutSet;
++    set<int> HoistedExprValues;
++    if (BBOutSet.count()) {
++      BasicBlock *OutBB = BBFlowData.first;
++      for (unsigned int IterIndex = 0; IterIndex < BBOutSet.size();
++           ++IterIndex) {
++        if (BBOutSet[IterIndex] &&
++            HoistedExprValues.find(IterIndex) == HoistedExprValues.end()) {
++          HoistedExprValues.insert(IterIndex);
++          AnticipatedExpression *HoistExprValue = ReverseExprMapData[IterIndex];
++          LLVM_DEBUG(dbgs() << "BBDump is :- \n");
++          LLVM_DEBUG(OutBB->dump());
++          vector<Instruction *> ExprInstrMapperValues =
++              ExprInstrMapper[HoistExprValue];
++          vector<Instruction *> ActualExprInstrMapperValues =
++              getHoistInstructionsFromExpr(HoistExprValue, OutBB,
++                                           ExprInstrMapperValues);
++          Instruction *ReplaceInstr = ActualExprInstrMapperValues[0];
++          LLVM_DEBUG(dbgs() << "Hoisting Instruction :- \n");
++          LLVM_DEBUG(ReplaceInstr->dump());
++          ReplaceInstr->moveBefore(&OutBB->back());
++          for (unsigned int IterIndex = 1;
++               IterIndex < ActualExprInstrMapperValues.size(); ++IterIndex) {
++            LLVM_DEBUG(dbgs() << "Replaced Instr :- \n");
++            LLVM_DEBUG(ActualExprInstrMapperValues[IterIndex]->dump());
++            if (ActualExprInstrMapperValues[IterIndex]->getParent() !=
++                ReplaceInstr->getParent()) {
++              ActualExprInstrMapperValues[IterIndex]->replaceAllUsesWith(
++                  ReplaceInstr);
++              ActualExprInstrMapperValues[IterIndex]->eraseFromParent();
++            }
++          }
++          ++HoistedExprcount;
++          // Hoisted an Expression, so return and re-calculate the entire
++          // FlowData to get new busy-expression.
++          return;
++        }
++      }
++    }
++  }
++}
++
++bool hoistAnticipatedExpressions(Function *Func) {
++  // Helper Function that keep iterating till all the busy-expressions are
++  // possibly hoisted.
++  int HoistIterCount = 1;
++  while (true) {
++    LLVM_DEBUG(dbgs() << "\n\nHoistingAnalysis " << HoistIterCount << " :- \n");
++    clearGlobalData();
++    int UniqueExprCount = buildUniqueExpressions(Func);
++    printExprData();
++    map<BasicBlock *, AnticipatedExpression::BBFlowData *> FlowData;
++    FlowData = initFlowData(Func, UniqueExprCount);
++    vector<AnticipatedExpression *> ExprToHoist =
++        computeFlowData(Func, UniqueExprCount, FlowData);
++    LLVM_DEBUG(dbgs() << "Found " << ExprToHoist.size()
++                      << " Expressions to hoist\n");
++    if (!ExprToHoist.size()) {
++      LLVM_DEBUG(dbgs() << "No Expressions found to hoist anymore\n");
++      LLVM_DEBUG(dbgs() << "Hoisted an total of " << HoistedExprcount
++                        << " expressions\n");
++      return true;
++    }
++    hoistExpressionData(ExprToHoist, FlowData);
++    ++HoistIterCount;
++  }
++}
++
++PreservedAnalyses
++HoistAnticipatedExpressionsPass::run(Function &F, FunctionAnalysisManager &AM) {
++  if (!hoistAnticipatedExpressions(&F)) {
++    PreservedAnalyses::all();
++  }
++  return PreservedAnalyses::none();
++}
+\ No newline at end of file
+-- 
+2.34.1
+
